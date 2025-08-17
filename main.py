@@ -52,6 +52,13 @@ def parse_cli_args():
     
     p.add_argument( "-r", "--referrer", default="",
         help="Referrer some sites require correct referrer: https://example.com/page-that-links-to-these-files")
+
+    # NEW: put results into a subfolder named after the filename (without extension)
+    p.add_argument(
+        "--into-subfolder",
+        action="store_true",
+        help="Move outputs into a subfolder named after the original filename (without extension)."
+    )
     return p.parse_args()
 
 args = parse_cli_args()
@@ -67,6 +74,9 @@ temp_dir.mkdir(exist_ok=True)
 
 # Flip based on --no-extract
 extract_zips = not args.no_extract
+
+# Optional: place results into a subfolder per item name (without extension)
+into_subfolder = args.into_subfolder
 
 # Use the same concurrency for downloads and for extract/move
 max_downloads = max(1, args.concurrency)
@@ -97,6 +107,7 @@ extract_queue = queue.Queue()       # extract tasks
 move_queue = queue.Queue()          # move tasks
 
 # ---------------- Helpers ----------------
+
 def _parse_content_range_total(value: str) -> int:
     try:
         return int(value.split("/")[-1])
@@ -122,6 +133,15 @@ def _range_probe_total(url: str, headers: dict) -> int:
     except Exception:
         return 0
 
+def _base_stem(name: str) -> str:
+    """Return filename stem while handling common multi-part extensions."""
+    lower = name.lower()
+    for ext in (".tar.gz", ".tar.bz2", ".tar.xz", ".tbz2", ".tgz", ".tar.zst", ".7z", ".zip", ".rar"):
+        if lower.endswith(ext):
+            return name[: -len(ext)]
+    return Path(name).stem
+
+
 def report(kind, slot, done_bytes, total_bytes, desc, job):
     """Send progress (BYTES) + a job key (filename) to the UI loop."""
     progress_queue.put((kind, slot, int(done_bytes), int(total_bytes), desc, job))
@@ -132,6 +152,7 @@ def _sleep_backoff(attempt: int):
     time.sleep(max(0.1, base + random.uniform(-jitter, jitter)))
 
 # ---------------- Workers ----------------
+
 def download_worker(slot):
     while True:
         url = download_queue.get()  # BLOCK
@@ -316,8 +337,8 @@ def move_worker(slot):
                 continue
 
             if src.is_dir():
-                dest = download_dir
-                dest.mkdir(parents=True, exist_ok=True)
+                dest_root = (download_dir / _base_stem(filename)) if into_subfolder else download_dir
+                dest_root.mkdir(parents=True, exist_ok=True)
                 files = [f for f in src.rglob('*') if f.is_file()]
                 total = sum((f.stat().st_size for f in files), 0) or 1
                 done = 0
@@ -326,7 +347,7 @@ def move_worker(slot):
 
                 for f in files:
                     rel = f.relative_to(src)
-                    target = dest / rel
+                    target = dest_root / rel
                     target.parent.mkdir(parents=True, exist_ok=True)
 
                     with open(f, "rb") as rf, open(target, "wb") as wf:
@@ -348,8 +369,9 @@ def move_worker(slot):
 
             else:
                 # Single file (non-zip)
-                dest_file = download_dir / filename
-                dest_file.parent.mkdir(parents=True, exist_ok=True)
+                dest_root = (download_dir / _base_stem(filename)) if into_subfolder else download_dir
+                dest_root.mkdir(parents=True, exist_ok=True)
+                dest_file = dest_root / filename
 
                 try:
                     size = src.stat().st_size
@@ -386,6 +408,7 @@ def move_worker(slot):
             move_queue.task_done()
 
 # ---------------- Main progress manager ----------------
+
 def progress_manager():
     import time
 
@@ -740,6 +763,7 @@ for i in range(max_extracts):
     threads_mv.append(t)
 
 # ---- SIGINT handler: stop + drain pending downloads (not yet started) ----
+
 def drain_pending_downloads():
     global cancelled_downloads
     drained = 0
