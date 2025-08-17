@@ -16,6 +16,7 @@ Works great for bulk file grabs or any large URL list.
 * ✅ Graceful Ctrl-C (stop queuing new work; let active tasks finish)
 * ✅ Windows-friendly (UNC paths supported)
 
+![Screenshot 1](screenshot.png)
 ---
 
 ## Requirements
