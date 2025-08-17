@@ -1,0 +1,5 @@
+requests>=2.31.0
+tqdm>=4.66.0
+Flask>=2.3
+colorama>=0.4.6; platform_system=="Windows"    # optional, for nicer colors on Windows
+typing-extensions>=4.7; python_version<"3.10"  # only needed if you use modern typing without the future import
