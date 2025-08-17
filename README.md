@@ -136,15 +136,15 @@ python main.py -u urls.txt -d ./downloads -c 8 --no-extract
 
 ---
 
-## Start the Flask Web UI
+## Start the Web UI
 
-There’s a simple web UI for configuring and running jobs in your browser.
+There’s a simple web UI for configuring and running jobs in your browser instead of using the command line
 
 ```bash
 python downloader_web.py
 ```
 
-Then open: **[http://127.0.0.1:5000/](http://127.0.0.1:5000/)**
+Then open: **[http://127.0.0.1:8000/](http://127.0.0.1:8000/)**
 
 From the UI you can:
 
