@@ -4,6 +4,7 @@ Robin's Downloader – Web UI (Flask + SSE)
 
 What you get:
 - Paste URLs, pick destination, set concurrency, toggle unzip, set Referrer
+- NEW: Optional "Into subfolder" mode – moves outputs under a subfolder named after the filename (without extension)
 - Live progress in browser (download / extract / move + overall)
 - Resume (.part), retry/backoff, graceful Stop
 
@@ -108,12 +109,22 @@ def _range_probe_total(url: str, headers: dict) -> int:
         return 0
 
 
+def _base_stem(name: str) -> str:
+    """Return filename stem while handling common multi-part extensions."""
+    lower = name.lower()
+    for ext in (".tar.gz", ".tar.bz2", ".tar.xz", ".tbz2", ".tgz", ".tar.zst", ".7z", ".zip", ".rar"):
+        if lower.endswith(ext):
+            return name[: -len(ext)]
+    return Path(name).stem
+
+
 class DownloaderJob:
-    def __init__(self, urls, dest: Path, concurrency: int, extract_zips: bool, referrer: Optional[str] = None):
+    def __init__(self, urls, dest: Path, concurrency: int, extract_zips: bool, referrer: Optional[str] = None, into_subfolder: bool = False):
         self.urls = [u.strip() for u in urls if u.strip()]
         self.dest = Path(dest)
         self.dest.mkdir(parents=True, exist_ok=True)
         self.extract_zips = bool(extract_zips)
+        self.into_subfolder = bool(into_subfolder)
         self.conc = max(1, int(concurrency))
 
         # headers (override Referer if provided)
@@ -171,8 +182,6 @@ class DownloaderJob:
     def _download_worker(self, slot):
         while True:
             got_item = False
-            url = None
-            filename = None
             try:
                 try:
                     url = self.q_dl.get(timeout=0.25)
@@ -276,8 +285,6 @@ class DownloaderJob:
         CHUNK = 1024 * 1024
         while True:
             got_item = False
-            task = None
-            filename = None
             try:
                 try:
                     task = self.q_ex.get(timeout=0.25)
@@ -313,9 +320,16 @@ class DownloaderJob:
                                         remaining -= clen
                                         done += clen
                                         self.report("extract", slot, done, total, f"{filename[:25]}", filename)
-                        # done -> queue move and delete zip after
+                        # done -> queue move
                         self.report("extract", slot, total, total, f"{filename[:25]} done", filename)
-                        self.q_mv.put((extract_dir, filename, temp_path))
+
+                        # delete original zip immediately to save space
+                        try:
+                            temp_path.unlink()
+                        except Exception:
+                            pass
+
+                        self.q_mv.put((extract_dir, filename, None))
                     else:
                         size = temp_path.stat().st_size if temp_path.exists() else 1
                         self.report("extract", slot, size, size, f"{filename[:25]} done", filename)
@@ -330,8 +344,6 @@ class DownloaderJob:
         CHUNK = 1024 * 1024
         while True:
             got_item = False
-            task = None
-            filename = None
             try:
                 try:
                     task = self.q_mv.get(timeout=0.25)
@@ -343,18 +355,18 @@ class DownloaderJob:
                 if task is None:
                     break
 
-                src, filename, zip_to_delete = task
+                src, filename, _ignored = task
                 try:
                     if src.is_dir():
-                        dest = self.dest
-                        dest.mkdir(parents=True, exist_ok=True)
+                        dest_root = (self.dest / _base_stem(filename)) if self.into_subfolder else self.dest
+                        dest_root.mkdir(parents=True, exist_ok=True)
                         files = [f for f in src.rglob('*') if f.is_file()]
                         total = sum((f.stat().st_size for f in files), 0) or 1
                         done = 0
                         self.report("move", slot, 0, total, f"{filename[:25]}", filename)
                         for f in files:
                             rel = f.relative_to(src)
-                            target = dest / rel
+                            target = dest_root / rel
                             target.parent.mkdir(parents=True, exist_ok=True)
                             with open(f, "rb") as rf, open(target, "wb") as wf:
                                 while True:
@@ -365,7 +377,7 @@ class DownloaderJob:
                                     clen = len(chunk)
                                     done += clen
                                     self.report("move", slot, done, total, f"{filename[:25]}", filename)
-                        # cleanup
+                        # cleanup extracted temp dir
                         try:
                             for f in files:
                                 try:
@@ -375,18 +387,14 @@ class DownloaderJob:
                             src.rmdir()
                         except Exception:
                             pass
-                        if zip_to_delete and zipfile.is_zipfile(zip_to_delete):
-                            try:
-                                zip_to_delete.unlink()
-                            except Exception:
-                                pass
                         self.report("move", slot, total, total, f"{filename[:25]} done", filename)
                         self.completed += 1
                         self._pub({"type": "overall", "completed": self.completed, "total": self.total_jobs,
                                    "active": self.active, "stopping": self.shutdown.is_set()})
                     else:
-                        dest_file = self.dest / filename
-                        dest_file.parent.mkdir(parents=True, exist_ok=True)
+                        dest_root = (self.dest / _base_stem(filename)) if self.into_subfolder else self.dest
+                        dest_root.mkdir(parents=True, exist_ok=True)
+                        dest_file = dest_root / filename
                         size = src.stat().st_size if src.exists() else 1
                         done = 0
                         self.report("move", slot, 0, size, f"{filename[:25]}", filename)
@@ -550,6 +558,7 @@ def start_job():
         conc = int(data.get("concurrency") or 4)
         do_extract = bool(data.get("extract", True))
         referrer = (data.get("referrer") or "").strip()  # optional
+        into_subfolder = bool(data.get("into_subfolder", False))
         if not urls_text or not dest:
             return jsonify({"ok": False, "error": "urls and dest are required"}), 400
         urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
@@ -558,7 +567,8 @@ def start_job():
             dest=Path(dest),
             concurrency=conc,
             extract_zips=do_extract,
-            referrer=referrer
+            referrer=referrer,
+            into_subfolder=into_subfolder,
         )
         current_job.start()
         return jsonify({"ok": True})
@@ -640,11 +650,12 @@ INDEX_HTML = r"""
     <section class="card">
       <div>
         <label>URLs (one per line)</label>
-        <textarea id="urls" placeholder="https://host/file1.zip\nhttps://host/file2.zip"></textarea>
+        <textarea id="urls" placeholder="https://host/file1.zip
+https://host/file2.zip"></textarea>
       </div>
       <div>
         <label>Destination path</label>
-        <input id="dest" placeholder="C:\\Downloads" />
+        <input id="dest" placeholder="C:\Downloads" />
       </div>
       <div>
         <label>Referrer (optional some sites require this to download or get full speed)</label>
@@ -658,6 +669,7 @@ INDEX_HTML = r"""
         <div style="flex:1">
           <label>&nbsp;</label>
           <label class="row" style="gap:6px"><input id="extract" type="checkbox" checked /> Extract ZIPs</label>
+          <label class="row" style="gap:6px; margin-top:6px"><input id="into_subfolder" type="checkbox" /> Into subfolder per file</label>
         </div>
       </div>
       <div class="row" style="margin-top:10px">
@@ -738,6 +750,7 @@ INDEX_HTML = r"""
     const referrer = document.getElementById('referrer').value.trim();
     const conc = parseInt(document.getElementById('conc').value||'4',10);
     const extract = document.getElementById('extract').checked;
+    const into_subfolder = document.getElementById('into_subfolder').checked;
     if(!urls || !dest){ alert('Please provide URLs and destination path'); return; }
     state.conc = conc; renderSections();
     document.getElementById('start').disabled = true;
@@ -746,7 +759,7 @@ INDEX_HTML = r"""
     const res = await fetch('/start', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({urls,dest,concurrency:conc,extract,referrer})
+      body: JSON.stringify({urls,dest,concurrency:conc,extract,referrer,into_subfolder})
     });
     const j = await res.json().catch(()=>({}));
     if(!res.ok){
