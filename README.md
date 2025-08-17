@@ -103,12 +103,15 @@ python main.py --urls <FILE> --dest <FOLDER> [--concurrency N] [--no-extract]
 * `--no-extract`
   Don’t extract ZIPs; just download/move them.
 
+* `-r, --referrer`
+  Some sites don't allow download with incorrect referrer or slow download speeds, you can set this optionally
+
 ### Examples
 
 **Basic:**
 
 ```bash
-python main.py -u urls.txt -d ./downloads
+python main.py -u urls.txt -d ./downloads -r "https://www.example.com"
 ```
 
 **UNC destination on Windows (CMD):**

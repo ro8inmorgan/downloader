@@ -3,7 +3,7 @@
 Robin's Downloader – Web UI (Flask + SSE)
 
 What you get:
-- Paste URLs, pick destination, set concurrency, toggle unzip
+- Paste URLs, pick destination, set concurrency, toggle unzip, set Referrer
 - Live progress in browser (download / extract / move + overall)
 - Resume (.part), retry/backoff, graceful Stop
 
@@ -14,10 +14,6 @@ Open:
 
 Requirements (pip):
   flask, requests, colorama (optional on Windows)
-
-Notes:
-- This is a *single file* app: it serves its own HTML/JS.
-- The core downloader is adapted from your CLI script but trimmed for the web.
 """
 from typing import Optional, Union, Dict, List, Tuple, Any
 import os
@@ -76,10 +72,11 @@ BACKOFF_BASE = 1.0
 BACKOFF_FACTOR = 2.0
 BACKOFF_JITTER = 0.25
 
-REFERRER = "https://myrient.erista.me/"
-HEADERS = {
+# Default headers; Referer can be overridden from the UI
+REFERRER_DEFAULT = "https://www.example.com/"
+HEADERS_DEFAULT = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Referer": REFERRER,
+    "Referer": REFERRER_DEFAULT,
 }
 
 
@@ -112,12 +109,22 @@ def _range_probe_total(url: str, headers: dict) -> int:
 
 
 class DownloaderJob:
-    def __init__(self, urls, dest: Path, concurrency: int, extract_zips: bool):
+    def __init__(self, urls, dest: Path, concurrency: int, extract_zips: bool, referrer: Optional[str] = None):
         self.urls = [u.strip() for u in urls if u.strip()]
         self.dest = Path(dest)
         self.dest.mkdir(parents=True, exist_ok=True)
         self.extract_zips = bool(extract_zips)
         self.conc = max(1, int(concurrency))
+
+        # headers (override Referer if provided)
+        self.headers = dict(HEADERS_DEFAULT)
+        if referrer is not None:
+            ref = referrer.strip()
+            if ref:
+                self.headers["Referer"] = ref
+            else:
+                # if blank, omit Referer entirely (some hosts are picky)
+                self.headers.pop("Referer", None)
 
         # temp dir colocated with script
         self.temp_dir = Path(__file__).parent / "temp"
@@ -184,7 +191,7 @@ class DownloaderJob:
                 continue
 
             try:
-                total = _head_content_length(url, HEADERS) or _range_probe_total(url, HEADERS)
+                total = _head_content_length(url, self.headers) or _range_probe_total(url, self.headers)
                 if temp_final.exists() and total and temp_final.stat().st_size >= total:
                     self.report("download", slot, total, total, f"{filename[:25]} done", filename)
                     self.q_ex.put((temp_final, filename))
@@ -200,7 +207,7 @@ class DownloaderJob:
                         self.report("download", slot, 0, 0, f"{filename[:25]} CANCELLED", filename)
                         break
                     attempt += 1
-                    h = dict(HEADERS)
+                    h = dict(self.headers)
                     h.setdefault("Accept-Encoding", "identity")
                     if done > 0:
                         h["Range"] = f"bytes={done}-"
@@ -395,10 +402,8 @@ class DownloaderJob:
         # seed overall row
         self._pub({"type": "overall", "completed": 0, "total": self.total_jobs,
                    "active": self.active, "stopping": False})
-        # title ping (optional)
         self._pub({"type": "status", "message": "Started"})
 
-        # live per-slot smoothing + active counts
         last = {}  # (kind,slot) -> last_done
         while True:
             try:
@@ -418,16 +423,13 @@ class DownloaderJob:
             if st is None:
                 st = {"last_done": 0, "spd_bytes": 0, "spd_t0": now, "rate": 0.0, "job": job}
                 self.spd_state[key] = st
-            # track active counts
             in_prog = not ("FAILED" in (desc or "") or (desc or "").endswith(" done") or (total and done >= total))
             if key not in last:
-                # first message for this slot -> increment active
                 if in_prog:
                     self.active[kind] += 1
                     self._pub({"type": "overall", "completed": self.completed, "total": self.total_jobs,
                                "active": self.active, "stopping": self.shutdown.is_set()})
 
-            # speed smoothing
             delta = max(0, done - st["last_done"])
             st["spd_bytes"] += delta
             elapsed = now - st["spd_t0"]
@@ -437,7 +439,6 @@ class DownloaderJob:
                 st["spd_t0"] = now
             st["last_done"] = done
 
-            # publish slot update
             self._pub({
                 "type": "update",
                 "kind": kind,
@@ -448,30 +449,24 @@ class DownloaderJob:
                 "rate": round(st["rate"], 2),
             })
 
-            # completion -> decrement active
             finished = ("FAILED" in (desc or "")) or (desc or "").endswith(" done") or (total and done >= total)
             if finished and key in last:
-                # only decrement if we had previously counted it as active
                 if self.active.get(kind, 0) > 0:
                     self.active[kind] -= 1
                 self._pub({"type": "overall", "completed": self.completed, "total": self.total_jobs,
                            "active": self.active, "stopping": self.shutdown.is_set()})
-                # reset per-slot speed state so next job in same slot starts fresh
                 self.spd_state.pop(key, None)
                 last.pop(key, None)
             else:
                 last[key] = done
 
-        # tell UI we’re done
         self._pub({"type": "status", "message": "Finished"})
 
     # --------- control ---------
     def start(self):
-        # enqueue urls
         for u in self.urls:
             self.q_dl.put(u)
 
-        # start workers
         for i in range(self.conc):
             t = threading.Thread(target=self._download_worker, args=(i,), daemon=True)
             t.start(); self.threads.append(t)
@@ -482,13 +477,11 @@ class DownloaderJob:
             t = threading.Thread(target=self._move_worker, args=(i,), daemon=True)
             t.start(); self.threads.append(t)
 
-        # manager -> SSE
         self._mgr_thread = threading.Thread(target=self._manager, daemon=True)
         self._mgr_thread.start()
 
     def stop(self):
         self.shutdown.set()
-        # stop starting new downloads: drain pending
         drained = 0
         while True:
             try:
@@ -500,16 +493,13 @@ class DownloaderJob:
             self.q_dl.task_done()
         if drained:
             pubsub.publish({"type": "status", "message": f"Cancelled {drained} queued downloads"})
-        # send sentinels so threads can exit when queues empty
         for _ in range(self.conc):
             self.q_dl.put(None)
             self.q_ex.put(None)
             self.q_mv.put(None)
 
     def join(self):
-        # wait for queues
         self.q_dl.join(); self.q_ex.join(); self.q_mv.join()
-        # join threads a bit
         for t in self.threads:
             t.join(timeout=1)
         if self._mgr_thread:
@@ -518,8 +508,7 @@ class DownloaderJob:
 
 # ---------- Global job holder ----------
 job_lock = threading.Lock()
-current_job: Optional[DownloaderJob] = None
-  # type: ignore
+current_job: Optional[DownloaderJob] = None  # type: ignore
 
 
 # ---------- Routes ----------
@@ -539,10 +528,17 @@ def start_job():
         dest = (data.get("dest") or "").strip()
         conc = int(data.get("concurrency") or 4)
         do_extract = bool(data.get("extract", True))
+        referrer = (data.get("referrer") or "").strip()  # <-- NEW
         if not urls_text or not dest:
             return jsonify({"ok": False, "error": "urls and dest are required"}), 400
         urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
-        current_job = DownloaderJob(urls=urls, dest=Path(dest), concurrency=conc, extract_zips=do_extract)
+        current_job = DownloaderJob(
+            urls=urls,
+            dest=Path(dest),
+            concurrency=conc,
+            extract_zips=do_extract,
+            referrer=referrer  # <-- NEW
+        )
         current_job.start()
         return jsonify({"ok": True})
 
@@ -568,7 +564,6 @@ def stream():
                 try:
                     data = q.get(timeout=30)
                 except queue.Empty:
-                    # keep-alive
                     yield "\n\n"
                     continue
                 yield f"data: {data}\n\n"
@@ -577,7 +572,7 @@ def stream():
 
     return Response(gen(), mimetype="text/event-stream", headers={
         "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",  # for nginx
+        "X-Accel-Buffering": "no",
     })
 
 
@@ -628,7 +623,11 @@ INDEX_HTML = r"""
       </div>
       <div>
         <label>Destination path</label>
-        <input id="dest" placeholder="\\\\192.168.2.8\\roms\\Games\\roms\\psp" />
+        <input id="dest" placeholder="C:\Downloads" />
+      </div>
+      <div>
+        <label>Referrer (optional)</label>  <!-- NEW -->
+        <input id="referrer" placeholder="https://example.com/page-that-links-to-these-files" />
       </div>
       <div class="row">
         <div style="flex:1">
@@ -715,6 +714,7 @@ INDEX_HTML = r"""
   document.getElementById('start').onclick = async () => {
     const urls = document.getElementById('urls').value.trim();
     const dest = document.getElementById('dest').value.trim();
+    const referrer = document.getElementById('referrer').value.trim(); // NEW
     const conc = parseInt(document.getElementById('conc').value||'4',10);
     const extract = document.getElementById('extract').checked;
     if(!urls || !dest){ alert('Please provide URLs and destination path'); return; }
@@ -722,9 +722,17 @@ INDEX_HTML = r"""
     document.getElementById('start').disabled = true;
     document.getElementById('stop').disabled = false;
     document.getElementById('status').textContent = '';
-    const res = await fetch('/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({urls,dest,concurrency:conc,extract})});
+    const res = await fetch('/start', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({urls,dest,concurrency:conc,extract,referrer}) // NEW
+    });
     const j = await res.json().catch(()=>({}));
-    if(!res.ok){ document.getElementById('status').textContent = j.error || 'Failed to start'; document.getElementById('start').disabled=false; document.getElementById('stop').disabled=true; }
+    if(!res.ok){
+      document.getElementById('status').textContent = j.error || 'Failed to start';
+      document.getElementById('start').disabled=false;
+      document.getElementById('stop').disabled=true;
+    }
   };
   document.getElementById('stop').onclick = async () => {
     document.getElementById('stop').disabled = true;

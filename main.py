@@ -49,6 +49,9 @@ def parse_cli_args():
     )
     p.add_argument("--retries", type=int, default=5,
         help="Max download attempts per URL. Default: 5")
+    
+    p.add_argument( "-r", "--referrer", default="https://www.example.com",
+        help="Referrer some sites require correct referrer: https://www.example.com")
     return p.parse_args()
 
 args = parse_cli_args()
@@ -70,7 +73,7 @@ max_downloads = max(1, args.concurrency)
 max_extracts  = max(1, args.concurrency)
 MAX_DOWNLOAD_TRIES = max(1, args.retries)
 
-referrer = "https://myrient.erista.me/"
+referrer = args.referrer
 headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "Referer": referrer
