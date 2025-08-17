@@ -8,14 +8,14 @@ What you get:
 - Resume (.part), retry/backoff, graceful Stop
 
 Run:
-  python downloader_webui.py
+  python downloader_webui_fixed.py
 Open:
   http://localhost:8000
 
 Requirements (pip):
   flask, requests, colorama (optional on Windows)
 """
-from typing import Optional, Union, Dict, List, Tuple, Any
+from typing import Optional
 import os
 import time
 import json
@@ -170,178 +170,227 @@ class DownloaderJob:
 
     def _download_worker(self, slot):
         while True:
+            got_item = False
+            url = None
+            filename = None
             try:
-                url = self.q_dl.get(timeout=0.25)
-            except queue.Empty:
-                if self.shutdown.is_set():
-                    break
-                continue
-            if url is None:
-                self.q_dl.task_done()
-                break
-
-            filename = unquote(url.split("/")[-1] or "file.zip")
-            temp_final = self.temp_dir / filename
-            temp_part = self.temp_dir / (filename + ".part")
-
-            # If stopping and nothing to resume, skip
-            if self.shutdown.is_set() and not temp_part.exists() and not temp_final.exists():
-                self.report("download", slot, 0, 0, f"{filename[:25]} CANCELLED", filename)
-                self.q_dl.task_done()
-                continue
-
-            try:
-                total = _head_content_length(url, self.headers) or _range_probe_total(url, self.headers)
-                if temp_final.exists() and total and temp_final.stat().st_size >= total:
-                    self.report("download", slot, total, total, f"{filename[:25]} done", filename)
-                    self.q_ex.put((temp_final, filename))
-                    self.q_dl.task_done()
+                try:
+                    url = self.q_dl.get(timeout=0.25)
+                    got_item = True
+                except queue.Empty:
+                    if self.shutdown.is_set():
+                        break
                     continue
 
-                done = temp_part.stat().st_size if temp_part.exists() else 0
-                self.report("download", slot, done, total, f"{filename[:25]}", filename)
+                if url is None:
+                    # sentinel: exit loop; finally will task_done() once
+                    break
 
-                attempt = 0
-                while True:
-                    if self.shutdown.is_set() and not temp_part.exists():
-                        self.report("download", slot, 0, 0, f"{filename[:25]} CANCELLED", filename)
-                        break
-                    attempt += 1
-                    h = dict(self.headers)
-                    h.setdefault("Accept-Encoding", "identity")
-                    if done > 0:
-                        h["Range"] = f"bytes={done}-"
-                    elif total:
-                        h["Range"] = "bytes=0-"
-                    try:
-                        r = requests.get(url, headers=h, stream=True, timeout=60, allow_redirects=True)
-                        if r.status_code >= 500 or r.status_code == 429:
-                            raise requests.HTTPError(f"HTTP {r.status_code}")
-                        r.raise_for_status()
-                        if done > 0 and r.status_code == 200:
-                            done = 0
-                            try:
-                                temp_part.unlink(missing_ok=True)
-                            except Exception:
-                                pass
-                        if not total:
-                            total = int(r.headers.get("Content-Length", 0)) or total
-                        if not total:
-                            cr = r.headers.get("Content-Range")
-                            if cr:
-                                total = _parse_content_range_total(cr)
+                filename = unquote(url.split("/")[-1] or "file.zip")
+                temp_final = self.temp_dir / filename
+                temp_part = self.temp_dir / (filename + ".part")
 
-                        with open(temp_part, "ab" if done > 0 else "wb") as f:
-                            for chunk in r.iter_content(chunk_size=64 * 1024):
-                                if not chunk:
-                                    continue
-                                f.write(chunk)
-                                done += len(chunk)
-                                self.report("download", slot, done, total, f"{filename[:25]}", filename)
-                                if self.shutdown.is_set():
-                                    break
-                        # Done enough?
-                        if (total and done >= total) or (not total):
-                            break
-                        attempt = min(attempt, MAX_DOWNLOAD_TRIES - 1)
-                    except Exception:
-                        if attempt >= MAX_DOWNLOAD_TRIES:
-                            raise
-                        self._sleep_backoff(attempt)
+                # If stopping and nothing to resume, skip processing
+                if self.shutdown.is_set() and not temp_part.exists() and not temp_final.exists():
+                    self.report("download", slot, 0, 0, f"{filename[:25]} CANCELLED", filename)
+                    continue
+
+                try:
+                    total = _head_content_length(url, self.headers) or _range_probe_total(url, self.headers)
+                    if temp_final.exists() and total and temp_final.stat().st_size >= total:
+                        self.report("download", slot, total, total, f"{filename[:25]} done", filename)
+                        self.q_ex.put((temp_final, filename))
                         continue
 
-                # finalize
-                try:
-                    if temp_final.exists():
-                        temp_final.unlink()
-                except Exception:
-                    pass
-                if temp_part.exists():
-                    temp_part.replace(temp_final)
-                self.report("download", slot, total or done, total or done, f"{filename[:25]} done", filename)
-                self.q_ex.put((temp_final, filename))
+                    done = temp_part.stat().st_size if temp_part.exists() else 0
+                    self.report("download", slot, done, total, f"{filename[:25]}", filename)
 
-            except Exception:
-                self.report("download", slot, 0, 0, f"{filename[:25]} FAILED", filename)
+                    attempt = 0
+                    while True:
+                        if self.shutdown.is_set() and not temp_part.exists():
+                            self.report("download", slot, 0, 0, f"{filename[:25]} CANCELLED", filename)
+                            break
+                        attempt += 1
+                        h = dict(self.headers)
+                        h.setdefault("Accept-Encoding", "identity")
+                        if done > 0:
+                            h["Range"] = f"bytes={done}-"
+                        elif total:
+                            h["Range"] = "bytes=0-"
+                        try:
+                            r = requests.get(url, headers=h, stream=True, timeout=60, allow_redirects=True)
+                            if r.status_code >= 500 or r.status_code == 429:
+                                raise requests.HTTPError(f"HTTP {r.status_code}")
+                            r.raise_for_status()
+                            if done > 0 and r.status_code == 200:
+                                done = 0
+                                try:
+                                    temp_part.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                            if not total:
+                                total = int(r.headers.get("Content-Length", 0)) or total
+                            if not total:
+                                cr = r.headers.get("Content-Range")
+                                if cr:
+                                    total = _parse_content_range_total(cr)
+
+                            with open(temp_part, "ab" if done > 0 else "wb") as f:
+                                for chunk in r.iter_content(chunk_size=64 * 1024):
+                                    if not chunk:
+                                        continue
+                                    f.write(chunk)
+                                    done += len(chunk)
+                                    self.report("download", slot, done, total, f"{filename[:25]}", filename)
+                                    if self.shutdown.is_set():
+                                        break
+                            # Done enough?
+                            if (total and done >= total) or (not total):
+                                break
+                            attempt = min(attempt, MAX_DOWNLOAD_TRIES - 1)
+                        except Exception:
+                            if attempt >= MAX_DOWNLOAD_TRIES:
+                                raise
+                            self._sleep_backoff(attempt)
+                            continue
+
+                    # finalize
+                    try:
+                        if temp_final.exists():
+                            temp_final.unlink()
+                    except Exception:
+                        pass
+                    if temp_part.exists():
+                        temp_part.replace(temp_final)
+                    self.report("download", slot, total or done, total or done, f"{filename[:25]} done", filename)
+                    self.q_ex.put((temp_final, filename))
+
+                except Exception:
+                    self.report("download", slot, 0, 0, f"{filename[:25]} FAILED", filename)
+
             finally:
-                self.q_dl.task_done()
+                if got_item:
+                    self.q_dl.task_done()
 
     def _extract_worker(self, slot):
         CHUNK = 1024 * 1024
         while True:
+            got_item = False
+            task = None
+            filename = None
             try:
-                task = self.q_ex.get(timeout=0.25)
-            except queue.Empty:
-                if self.shutdown.is_set():
+                try:
+                    task = self.q_ex.get(timeout=0.25)
+                    got_item = True
+                except queue.Empty:
+                    if self.shutdown.is_set():
+                        break
+                    continue
+                if task is None:
                     break
-                continue
-            if task is None:
-                self.q_ex.task_done()
-                break
 
-            temp_path, filename = task
-            try:
-                if self.extract_zips and zipfile.is_zipfile(temp_path):
-                    extract_dir = self.temp_dir / f"ext_{slot}_{filename}"
-                    extract_dir.mkdir(parents=True, exist_ok=True)
-                    with zipfile.ZipFile(temp_path, 'r') as z:
-                        infos = [i for i in z.infolist() if not i.is_dir()]
-                        total = sum(i.file_size for i in infos) or 1
-                        done = 0
-                        self.report("extract", slot, 0, total, f"{filename[:25]}", filename)
-                        for info in infos:
-                            target = extract_dir / info.filename
-                            target.parent.mkdir(parents=True, exist_ok=True)
-                            with z.open(info) as src, open(target, "wb") as out:
-                                remaining = info.file_size
-                                while remaining > 0:
-                                    chunk = src.read(min(CHUNK, remaining))
-                                    if not chunk:
-                                        break
-                                    out.write(chunk)
-                                    clen = len(chunk)
-                                    remaining -= clen
-                                    done += clen
-                                    self.report("extract", slot, done, total, f"{filename[:25]}", filename)
-                    # done -> queue move and delete zip after
-                    self.report("extract", slot, total, total, f"{filename[:25]} done", filename)
-                    self.q_mv.put((extract_dir, filename, temp_path))
-                else:
-                    size = temp_path.stat().st_size if temp_path.exists() else 1
-                    self.report("extract", slot, size, size, f"{filename[:25]} done", filename)
-                    self.q_mv.put((temp_path, filename, None))
-            except Exception:
-                self.report("extract", slot, 0, 0, f"{filename[:25]} FAILED", filename)
+                temp_path, filename = task
+                try:
+                    if self.extract_zips and zipfile.is_zipfile(temp_path):
+                        extract_dir = self.temp_dir / f"ext_{slot}_{filename}"
+                        extract_dir.mkdir(parents=True, exist_ok=True)
+                        with zipfile.ZipFile(temp_path, 'r') as z:
+                            infos = [i for i in z.infolist() if not i.is_dir()]
+                            total = sum(i.file_size for i in infos) or 1
+                            done = 0
+                            self.report("extract", slot, 0, total, f"{filename[:25]}", filename)
+                            for info in infos:
+                                target = extract_dir / info.filename
+                                target.parent.mkdir(parents=True, exist_ok=True)
+                                with z.open(info) as src, open(target, "wb") as out:
+                                    remaining = info.file_size
+                                    while remaining > 0:
+                                        chunk = src.read(min(CHUNK, remaining))
+                                        if not chunk:
+                                            break
+                                        out.write(chunk)
+                                        clen = len(chunk)
+                                        remaining -= clen
+                                        done += clen
+                                        self.report("extract", slot, done, total, f"{filename[:25]}", filename)
+                        # done -> queue move and delete zip after
+                        self.report("extract", slot, total, total, f"{filename[:25]} done", filename)
+                        self.q_mv.put((extract_dir, filename, temp_path))
+                    else:
+                        size = temp_path.stat().st_size if temp_path.exists() else 1
+                        self.report("extract", slot, size, size, f"{filename[:25]} done", filename)
+                        self.q_mv.put((temp_path, filename, None))
+                except Exception:
+                    self.report("extract", slot, 0, 0, f"{filename[:25]} FAILED", filename)
             finally:
-                self.q_ex.task_done()
+                if got_item:
+                    self.q_ex.task_done()
 
     def _move_worker(self, slot):
         CHUNK = 1024 * 1024
         while True:
+            got_item = False
+            task = None
+            filename = None
             try:
-                task = self.q_mv.get(timeout=0.25)
-            except queue.Empty:
-                if self.shutdown.is_set():
+                try:
+                    task = self.q_mv.get(timeout=0.25)
+                    got_item = True
+                except queue.Empty:
+                    if self.shutdown.is_set():
+                        break
+                    continue
+                if task is None:
                     break
-                continue
-            if task is None:
-                self.q_mv.task_done()
-                break
 
-            src, filename, zip_to_delete = task
-            try:
-                if src.is_dir():
-                    dest = self.dest
-                    dest.mkdir(parents=True, exist_ok=True)
-                    files = [f for f in src.rglob('*') if f.is_file()]
-                    total = sum((f.stat().st_size for f in files), 0) or 1
-                    done = 0
-                    self.report("move", slot, 0, total, f"{filename[:25]}", filename)
-                    for f in files:
-                        rel = f.relative_to(src)
-                        target = dest / rel
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        with open(f, "rb") as rf, open(target, "wb") as wf:
+                src, filename, zip_to_delete = task
+                try:
+                    if src.is_dir():
+                        dest = self.dest
+                        dest.mkdir(parents=True, exist_ok=True)
+                        files = [f for f in src.rglob('*') if f.is_file()]
+                        total = sum((f.stat().st_size for f in files), 0) or 1
+                        done = 0
+                        self.report("move", slot, 0, total, f"{filename[:25]}", filename)
+                        for f in files:
+                            rel = f.relative_to(src)
+                            target = dest / rel
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            with open(f, "rb") as rf, open(target, "wb") as wf:
+                                while True:
+                                    chunk = rf.read(CHUNK)
+                                    if not chunk:
+                                        break
+                                    wf.write(chunk)
+                                    clen = len(chunk)
+                                    done += clen
+                                    self.report("move", slot, done, total, f"{filename[:25]}", filename)
+                        # cleanup
+                        try:
+                            for f in files:
+                                try:
+                                    f.unlink()
+                                except Exception:
+                                    pass
+                            src.rmdir()
+                        except Exception:
+                            pass
+                        if zip_to_delete and zipfile.is_zipfile(zip_to_delete):
+                            try:
+                                zip_to_delete.unlink()
+                            except Exception:
+                                pass
+                        self.report("move", slot, total, total, f"{filename[:25]} done", filename)
+                        self.completed += 1
+                        self._pub({"type": "overall", "completed": self.completed, "total": self.total_jobs,
+                                   "active": self.active, "stopping": self.shutdown.is_set()})
+                    else:
+                        dest_file = self.dest / filename
+                        dest_file.parent.mkdir(parents=True, exist_ok=True)
+                        size = src.stat().st_size if src.exists() else 1
+                        done = 0
+                        self.report("move", slot, 0, size, f"{filename[:25]}", filename)
+                        with open(src, "rb") as rf, open(dest_file, "wb") as wf:
                             while True:
                                 chunk = rf.read(CHUNK)
                                 if not chunk:
@@ -349,53 +398,20 @@ class DownloaderJob:
                                 wf.write(chunk)
                                 clen = len(chunk)
                                 done += clen
-                                self.report("move", slot, done, total, f"{filename[:25]}", filename)
-                    # cleanup
-                    try:
-                        for f in files:
-                            try:
-                                f.unlink()
-                            except Exception:
-                                pass
-                        src.rmdir()
-                    except Exception:
-                        pass
-                    if zip_to_delete and zipfile.is_zipfile(zip_to_delete):
+                                self.report("move", slot, done, size, f"{filename[:25]}", filename)
                         try:
-                            zip_to_delete.unlink()
+                            os.remove(src)
                         except Exception:
                             pass
-                    self.report("move", slot, total, total, f"{filename[:25]} done", filename)
-                    self.completed += 1
-                    self._pub({"type": "overall", "completed": self.completed, "total": self.total_jobs,
-                               "active": self.active, "stopping": self.shutdown.is_set()})
-                else:
-                    dest_file = self.dest / filename
-                    dest_file.parent.mkdir(parents=True, exist_ok=True)
-                    size = src.stat().st_size if src.exists() else 1
-                    done = 0
-                    self.report("move", slot, 0, size, f"{filename[:25]}", filename)
-                    with open(src, "rb") as rf, open(dest_file, "wb") as wf:
-                        while True:
-                            chunk = rf.read(CHUNK)
-                            if not chunk:
-                                break
-                            wf.write(chunk)
-                            clen = len(chunk)
-                            done += clen
-                            self.report("move", slot, done, size, f"{filename[:25]}", filename)
-                    try:
-                        os.remove(src)
-                    except Exception:
-                        pass
-                    self.report("move", slot, size, size, f"{filename[:25]} done", filename)
-                    self.completed += 1
-                    self._pub({"type": "overall", "completed": self.completed, "total": self.total_jobs,
-                               "active": self.active, "stopping": self.shutdown.is_set()})
-            except Exception:
-                self.report("move", slot, 0, 0, f"{filename[:25]} FAILED", filename)
+                        self.report("move", slot, size, size, f"{filename[:25]} done", filename)
+                        self.completed += 1
+                        self._pub({"type": "overall", "completed": self.completed, "total": self.total_jobs,
+                                   "active": self.active, "stopping": self.shutdown.is_set()})
+                except Exception:
+                    self.report("move", slot, 0, 0, f"{filename[:25]} FAILED", filename)
             finally:
-                self.q_mv.task_done()
+                if got_item:
+                    self.q_mv.task_done()
 
     # --------- manager -> SSE ---------
     def _manager(self):
@@ -461,6 +477,10 @@ class DownloaderJob:
                 last[key] = done
 
         self._pub({"type": "status", "message": "Finished"})
+        # allow a new job to start without restarting the app
+        global current_job
+        with job_lock:
+            current_job = None
 
     # --------- control ---------
     def start(self):
@@ -490,6 +510,7 @@ class DownloaderJob:
                 break
             if item is not None:
                 drained += 1
+            # mark the item we actually removed from the queue as done
             self.q_dl.task_done()
         if drained:
             pubsub.publish({"type": "status", "message": f"Cancelled {drained} queued downloads"})
@@ -528,7 +549,7 @@ def start_job():
         dest = (data.get("dest") or "").strip()
         conc = int(data.get("concurrency") or 4)
         do_extract = bool(data.get("extract", True))
-        referrer = (data.get("referrer") or "").strip()  # <-- NEW
+        referrer = (data.get("referrer") or "").strip()  # optional
         if not urls_text or not dest:
             return jsonify({"ok": False, "error": "urls and dest are required"}), 400
         urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
@@ -537,7 +558,7 @@ def start_job():
             dest=Path(dest),
             concurrency=conc,
             extract_zips=do_extract,
-            referrer=referrer  # <-- NEW
+            referrer=referrer
         )
         current_job.start()
         return jsonify({"ok": True})
@@ -623,10 +644,10 @@ INDEX_HTML = r"""
       </div>
       <div>
         <label>Destination path</label>
-        <input id="dest" placeholder="C:\Downloads" />
+        <input id="dest" placeholder="C:\\Downloads" />
       </div>
       <div>
-        <label>Referrer (optional some sites require this to download or get full speed)</label>  <!-- NEW -->
+        <label>Referrer (optional some sites require this to download or get full speed)</label>
         <input id="referrer" placeholder="https://example.com/page-that-links-to-these-files" />
       </div>
       <div class="row">
@@ -714,7 +735,7 @@ INDEX_HTML = r"""
   document.getElementById('start').onclick = async () => {
     const urls = document.getElementById('urls').value.trim();
     const dest = document.getElementById('dest').value.trim();
-    const referrer = document.getElementById('referrer').value.trim(); // NEW
+    const referrer = document.getElementById('referrer').value.trim();
     const conc = parseInt(document.getElementById('conc').value||'4',10);
     const extract = document.getElementById('extract').checked;
     if(!urls || !dest){ alert('Please provide URLs and destination path'); return; }
@@ -725,7 +746,7 @@ INDEX_HTML = r"""
     const res = await fetch('/start', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({urls,dest,concurrency:conc,extract,referrer}) // NEW
+      body: JSON.stringify({urls,dest,concurrency:conc,extract,referrer})
     });
     const j = await res.json().catch(()=>({}));
     if(!res.ok){
