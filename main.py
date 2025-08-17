@@ -73,6 +73,11 @@ max_downloads = max(1, args.concurrency)
 max_extracts  = max(1, args.concurrency)
 MAX_DOWNLOAD_TRIES = max(1, args.retries)
 
+# Backoff tuning (kept from your earlier pattern)
+BACKOFF_BASE = 1.0
+BACKOFF_FACTOR = 2.0
+BACKOFF_JITTER = 0.25
+
 referrer = args.referrer
 headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -141,7 +146,7 @@ def download_worker(slot):
             # If shutdown requested: skip brand-new downloads (but allow resumes/active)
             if shutdown_event.is_set() and not temp_partial.exists() and not temp_final.exists():
                 report("download", slot, 0, 0, f"{filename[:25]} CANCELLED", filename)
-                break
+                continue
 
             total = _head_content_length(url, headers) or _range_probe_total(url, headers)
 
@@ -226,6 +231,8 @@ def download_worker(slot):
             download_queue.task_done()
 
 def extract_worker(slot):
+    """Extract zips and DELETE the .zip immediately after successful extraction.
+       This saves temp space earlier. Non-zips get passed through unchanged."""
     CHUNK = 1024 * 1024  # 1 MiB
     while True:
         try:
@@ -240,31 +247,40 @@ def extract_worker(slot):
             if extract_zips and zipfile.is_zipfile(temp_path):
                 extract_dir = temp_dir / f"ext_{slot}_{filename}"
                 extract_dir.mkdir(parents=True, exist_ok=True)
-                with zipfile.ZipFile(temp_path, 'r') as z:
-                    infos = [i for i in z.infolist() if not i.is_dir()]
-                    total = sum(i.file_size for i in infos) or 1
-                    done = 0
+                try:
+                    with zipfile.ZipFile(temp_path, 'r') as z:
+                        infos = [i for i in z.infolist() if not i.is_dir()]
+                        total = sum(i.file_size for i in infos) or 1
+                        done = 0
 
-                    report("extract", slot, 0, total, f"{filename[:25]}", filename)
+                        report("extract", slot, 0, total, f"{filename[:25]}", filename)
 
-                    for info in infos:
-                        target = extract_dir / info.filename
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        with z.open(info) as source, open(target, "wb") as out:
-                            remaining = info.file_size
-                            while remaining > 0:
-                                chunk = source.read(min(CHUNK, remaining))
-                                if not chunk:
-                                    break
-                                out.write(chunk)
-                                clen = len(chunk)
-                                remaining -= clen
-                                done += clen
-                                report("extract", slot, done, total, f"{filename[:25]}", filename)
+                        for info in infos:
+                            target = extract_dir / info.filename
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            with z.open(info) as source, open(target, "wb") as out:
+                                remaining = info.file_size
+                                while remaining > 0:
+                                    chunk = source.read(min(CHUNK, remaining))
+                                    if not chunk:
+                                        break
+                                    out.write(chunk)
+                                    clen = len(chunk)
+                                    remaining -= clen
+                                    done += clen
+                                    report("extract", slot, done, total, f"{filename[:25]}", filename)
 
-                # extraction completed OK — queue the move and pass the zip path so it can be deleted after move
-                report("extract", slot, total, total, f"{filename[:25]} done", filename)
-                move_queue.put((extract_dir, filename, temp_path))  # <-- pass zip path here
+                    # extraction completed OK — DELETE the original zip NOW
+                    try:
+                        temp_path.unlink()
+                    except Exception:
+                        pass
+
+                    report("extract", slot, total, total, f"{filename[:25]} done", filename)
+                    # queue the extracted directory for move; zip already deleted
+                    move_queue.put((extract_dir, filename))
+                except Exception:
+                    report("extract", slot, 0, 0, f"{filename[:25]} FAILED", filename)
             else:
                 # Not a zip (or extraction disabled)
                 try:
@@ -292,12 +308,12 @@ def move_worker(slot):
             if task is None:  # sentinel
                 break
 
-            # Support both (src, filename) and (src, filename, zip_to_delete)
-            if isinstance(task, tuple) and len(task) == 3:
-                src, filename, zip_to_delete = task
+            # Expect (src, filename). Backward compatible: ignore any 3rd value if present.
+            if isinstance(task, tuple) and len(task) >= 2:
+                src, filename = task[0], task[1]
             else:
-                src, filename = task
-                zip_to_delete = None
+                # malformed; skip safely
+                continue
 
             if src.is_dir():
                 dest = download_dir
@@ -323,15 +339,8 @@ def move_worker(slot):
                             done += clen
                             report("move", slot, done, total, f"{filename[:25]}", filename)
 
-                # clean extracted folder
+                # clean extracted folder (zip already deleted in extract stage)
                 shutil.rmtree(src, ignore_errors=True)
-
-                # delete original zip *after* a successful move
-                if zip_to_delete and zip_to_delete.exists():
-                    try:
-                        zip_to_delete.unlink()
-                    except Exception:
-                        pass
 
                 report("move", slot, total, total, f"{filename[:25]} done", filename)
                 # bump overall
