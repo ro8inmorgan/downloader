@@ -50,8 +50,8 @@ def parse_cli_args():
     p.add_argument("--retries", type=int, default=5,
         help="Max download attempts per URL. Default: 5")
     
-    p.add_argument( "-r", "--referrer", default="https://www.example.com",
-        help="Referrer some sites require correct referrer: https://www.example.com")
+    p.add_argument( "-r", "--referrer", default="",
+        help="Referrer some sites require correct referrer: https://example.com/page-that-links-to-these-files")
     return p.parse_args()
 
 args = parse_cli_args()

@@ -626,7 +626,7 @@ INDEX_HTML = r"""
         <input id="dest" placeholder="C:\Downloads" />
       </div>
       <div>
-        <label>Referrer (optional)</label>  <!-- NEW -->
+        <label>Referrer (optional some sites require this to download or get full speed)</label>  <!-- NEW -->
         <input id="referrer" placeholder="https://example.com/page-that-links-to-these-files" />
       </div>
       <div class="row">
