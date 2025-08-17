@@ -17,7 +17,7 @@ Works great for bulk file grabs or any large URL list.
 * ✅ Windows-friendly (UNC paths supported)
 
 ![Screenshot 1](screenshot2.png)
-![Screenshot 2](screenshot.png)
+![Screenshot 2](screenshot1.png)
 ---
 
 ## Requirements
