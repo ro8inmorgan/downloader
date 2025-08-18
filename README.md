@@ -157,10 +157,12 @@ Then open: **[http://127.0.0.1:8000/](http://127.0.0.1:8000/)**
 
 From the UI you can:
 
+* Everything you can do with the cli
 * Select/enter the URL list file and destination folder
 * Set concurrency, toggle extraction
 * Start a job and watch live progress bars (mirrors the CLI display)
 * Cancel gracefully via the terminal (Ctrl-C) if needed
+* etc..
 
 > Want a different host/port? Edit `app.run(host=..., port=...)` near the bottom of `downloader_web.py`.
 
