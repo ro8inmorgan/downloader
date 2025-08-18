@@ -1,4 +1,4 @@
-# Robin’s File Downloader
+# Multi-threaded batch downloader
 
 Multi-threaded downloader with resume, ZIP extraction, pretty progress bars, and a simple Flask web UI.
 Works great for bulk file grabs or any large URL list.
@@ -87,7 +87,7 @@ https://example.com/file2.zip
 The core script accepts these arguments:
 
 ```bash
-python main.py --urls <FILE> --dest <FOLDER> [--concurrency N] [--no-extract]
+python main.py --urls <FILE> --dest <FOLDER> [--concurrency N] [--no-extract] [--referrer] [--into-subfolder]
 ```
 
 ### Arguments
@@ -106,17 +106,17 @@ python main.py --urls <FILE> --dest <FOLDER> [--concurrency N] [--no-extract]
   Don’t extract ZIPs; just download/move them.
 
 * `-r, --referrer`
-  Some sites don't allow download with incorrect referrer or slow download speeds, you can set this optionally
+  Some sites don't allow download with an incorrect referrer header or slow download speeds, you can set this optionally
 
 * `--into-subfolder`
-  Extracts each file into a subfolder of destination
+  Extracts/Moves every download into a subfolder in destination folder
 
 ### Examples
 
 **Basic:**
 
 ```bash
-python main.py -u urls.txt -d ./downloads -r "https://www.example.com"
+python main.py -u urls.txt -d ./downloads -r "https://www.example.com" 
 ```
 
 **UNC destination on Windows (CMD):**
@@ -137,6 +137,12 @@ python .\main.py -u .\urls.txt -d '\\192.168.2.8\downloads'
 python main.py -u urls.txt -d ./downloads -c 8 --no-extract
 ```
 
+**Extract each zip into a subfolder:**
+
+```bash
+python main.py -u urls.txt -d C:\downloads --into-subfolder
+```
+
 ---
 
 ## Start the Web UI
@@ -151,10 +157,12 @@ Then open: **[http://127.0.0.1:8000/](http://127.0.0.1:8000/)**
 
 From the UI you can:
 
+* Everything you can do with the cli
 * Select/enter the URL list file and destination folder
 * Set concurrency, toggle extraction
 * Start a job and watch live progress bars (mirrors the CLI display)
 * Cancel gracefully via the terminal (Ctrl-C) if needed
+* etc..
 
 > Want a different host/port? Edit `app.run(host=..., port=...)` near the bottom of `downloader_web.py`.
 
