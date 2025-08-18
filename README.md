@@ -87,7 +87,7 @@ https://example.com/file2.zip
 The core script accepts these arguments:
 
 ```bash
-python main.py --urls <FILE> --dest <FOLDER> [--concurrency N] [--no-extract]
+python main.py --urls <FILE> --dest <FOLDER> [--concurrency N] [--no-extract] [--referrer] [--into-subfolder]
 ```
 
 ### Arguments
@@ -116,7 +116,7 @@ python main.py --urls <FILE> --dest <FOLDER> [--concurrency N] [--no-extract]
 **Basic:**
 
 ```bash
-python main.py -u urls.txt -d ./downloads -r "https://www.example.com"
+python main.py -u urls.txt -d ./downloads -r "https://www.example.com" 
 ```
 
 **UNC destination on Windows (CMD):**
@@ -135,6 +135,12 @@ python .\main.py -u .\urls.txt -d '\\192.168.2.8\downloads'
 
 ```bash
 python main.py -u urls.txt -d ./downloads -c 8 --no-extract
+```
+
+**Extract each zip into a subfolder:**
+
+```bash
+python main.py -u urls.txt -d C:\downloads --into-subfolder
 ```
 
 ---
