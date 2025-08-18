@@ -408,28 +408,186 @@ def move_worker(slot):
             move_queue.task_done()
 
 # ---------------- Main progress manager ----------------
-
 def progress_manager():
     import time
+    import shutil as _shutil
 
     bars = {}   # (kind,slot) -> tqdm bar
     state = {}  # (kind,slot) -> per-bar state OR for overall: {'count'}
     active = {"download": 0, "extract": 0, "move": 0}  # live task counts
 
     # colors (download=cyan, extract=green, move=red, overall=magenta)
-    COLORS = {"download": "\033[96m", "extract": "\033[92m", "move": "\033[91m", "overall": "\033[95m"}
-    RESET = "\033[0m"
+    COLORS = {"download": "\u001b[96m", "extract": "\u001b[92m", "move": "\u001b[91m", "overall": "\u001b[95m"}
+    RESET = "\u001b[0m"
     SPEED_WINDOW_SEC = 0.35  # fast smoothing for snappy UI
 
-    # --- layout positions (title + 4 dividers + status line at bottom) ---
+    # ----- Dynamic layout that adapts to terminal width -----
+    # We keep reasonable mins/maxes and allocate the rest to the progress bar.
+    DESC_W = 40
+    BAR_W  = 40
+    INFO_W = 20
+    SEP_W  = 4  # " |" + "| "
+
+    def _get_term_cols():
+        try:
+            return _shutil.get_terminal_size(fallback=(120, 24)).columns
+        except Exception:
+            return 120
+
+    last_cols = _get_term_cols()
+
+    def _calc_layout(cols):
+        nonlocal DESC_W, BAR_W, INFO_W
+        # Desired targets
+        target_desc = 50
+        target_info = 20
+        min_desc, max_desc = 18, 80
+        min_info, max_info = 14, 28
+        min_bar = 10
+
+        # Start from targets within caps
+        desc = max(min_desc, min(max_desc, target_desc))
+        info = max(min_info, min(max_info, target_info))
+
+        # Ensure we fit; shrink desc then info before bar
+        total_needed = desc + info + SEP_W + min_bar
+        if total_needed > cols:
+            over = total_needed - cols
+            shrink = min(over, desc - min_desc)
+            desc -= shrink
+            over -= shrink
+            if over > 0:
+                shrink2 = min(over, info - min_info)
+                info -= shrink2
+                over -= shrink2
+            # If still over, bar will just hit its minimum; nothing more to do
+
+        bar = max(min_bar, cols - (desc + info + SEP_W))
+
+        DESC_W, INFO_W, BAR_W = desc, info, bar
+
+    def _apply_layout_to_bar(bar, kind, total_known):
+        color = COLORS.get(kind, "")
+        if kind == "overall":
+            # overall uses dynamic_ncols; compact format
+            BAR_FMT = (
+                f"{color}{{desc}}{RESET} | "
+                f"{{n_fmt}}/{{total_fmt}} | "
+                f"{{postfix}}"
+            )
+            bar.bar_format = BAR_FMT
+            return
+
+        # known/unknown formats with dynamic widths
+        BAR_FMT_KNOWN = (
+            f"{{desc:{DESC_W}.{DESC_W}}} |{color}{{bar:{BAR_W}}}{RESET}| "
+            f"{{n_fmt}}/{{total_fmt}} {{postfix:{INFO_W}.{INFO_W}}}"
+        )
+        BAR_FMT_UNKNOWN = (
+            f"{{desc:{DESC_W}.{DESC_W}}} |{color}{{n_fmt:{BAR_W}.{BAR_W}}}{RESET}| "
+            f"{{postfix:{INFO_W}.{INFO_W}}}"
+        )
+        bar.bar_format = BAR_FMT_KNOWN if total_known else BAR_FMT_UNKNOWN
+
+    def _maybe_relayout():
+        nonlocal last_cols
+        cols = _get_term_cols()
+        if cols != last_cols:
+            last_cols = cols
+            _calc_layout(cols)
+            # Re-apply formats to all existing non-overall bars
+            for (k, s), b in bars.items():
+                if k == "overall":
+                    _apply_layout_to_bar(b, "overall", True)
+                else:
+                    total_known = (b.total is not None)
+                    _apply_layout_to_bar(b, k, total_known)
+                    # Refresh to reflect new layout
+                    b.refresh()
+
+    # pad/truncate consistently
+    def fit(s, w):
+        s = s if s is not None else ""
+        if len(s) > w:
+            return s[:max(0, w-1)] + "…"
+        return f"{s:<{w}}"
+
+    # unified bar factory that respects dynamic widths
+    def make_bar(kind, slot, total, color):
+        total_val = None if total == 0 else total
+        if kind == "overall":
+            BAR_FMT = (
+                f"{color}{{desc}}{RESET} | "
+                f"{{n_fmt}}/{{total_fmt}} | "
+                f"{{postfix}}"
+            )
+            return tqdm(
+                total=TOTAL_JOBS,              # progress by items
+                position=row_pos(kind, slot),
+                unit="it",
+                leave=True,
+                bar_format=BAR_FMT,
+                mininterval=0.05,
+                dynamic_ncols=True,
+            )
+        else:
+            bar = tqdm(
+                total=total_val,
+                position=row_pos(kind, slot),
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                leave=True,
+                mininterval=0.05,
+                dynamic_ncols=True,
+            )
+            _apply_layout_to_bar(bar, kind, total_known=(total_val is not None))
+            return bar
+
+    def fmt_dur(sec):
+        if not sec or sec <= 0:
+            return "--"
+        s = int(sec)
+        if s < 60:
+            return f"{s}s"
+        m, s2 = divmod(s, 60)
+        if m < 60:
+            return f"{m}:{s2:02d}"
+        h, m2 = divmod(m, 60)
+        return f"{h}:{m2:02d}"
+
+    # rolling timing stats per stage (for avg item duration)
+    stage_stats = {
+        "download": {"count": 0, "total_time": 0.0},
+        "extract":  {"count": 0, "total_time": 0.0},
+        "move":     {"count": 0, "total_time": 0.0},
+    }
+
+    # --- STATIC LINES: title + dividers + status line ---
+    title = tqdm(total=1, position=0, leave=True, bar_format="\u001b[95;1m{desc}\u001b[0m", mininterval=0, dynamic_ncols=True)
+    title.desc = "★ ROBINS FILE DOWNLOADER ★"
+    title.n = 1
+    title.refresh()
+
+    def make_divider(position, text):
+        line = tqdm(total=1, position=position, leave=True, bar_format="\u001b[90m{desc}\u001b[0m", mininterval=0, dynamic_ncols=True)
+        if text:
+            line.desc = "─" * 8 + f" {text} " + "─" * 32
+        else:
+            line.desc = "─" * 48
+        line.n = 1
+        line.refresh()
+        return line
+
+    # We build the layout after we know concurrency to place rows
     POS_TITLE   = 0
-    POS_DIV0    = POS_TITLE + 1                 # NEW: "DOWNLOADS"
+    POS_DIV0    = POS_TITLE + 1                 # "DOWNLOADS"
     POS_DL_START= POS_DIV0 + 1
     POS_DIV1    = POS_DL_START + max_downloads  # "EXTRACT"
     POS_EX_START= POS_DIV1 + 1
     POS_DIV2    = POS_EX_START + max_extracts   # "MOVE"
     POS_MV_START= POS_DIV2 + 1
-    POS_DIV3    = POS_MV_START + max_extracts   # NEW: "OVERALL"
+    POS_DIV3    = POS_MV_START + max_extracts   # "OVERALL"
     POS_OVERALL = POS_DIV3 + 1
     POS_STATUS  = POS_OVERALL + 1               # persistent status line
 
@@ -445,78 +603,15 @@ def progress_manager():
         else:
             return POS_STATUS
 
-    def make_bar(kind, slot, total, color):
-        total_val = None if total == 0 else total
-        if kind == "overall":
-            BAR_FMT = f"{color}" + "{desc}: {n_fmt}/{total_fmt} [{elapsed}] {postfix}" + f"{RESET}"
-            return tqdm(
-                total=total_val,
-                position=row_pos(kind, slot),
-                unit="it",
-                leave=True,
-                bar_format=BAR_FMT,
-                mininterval=0.05,
-                dynamic_ncols=True,
-            )
-        else:
-            BAR_FMT_KNOWN   = "{desc}: {percentage:3.0f}%|" + color + "{bar}" + RESET + "| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}"
-            BAR_FMT_UNKNOWN = "{desc}: " + color + "{n_fmt}" + RESET + " [{elapsed}] {postfix}"
-            return tqdm(
-                total=total_val,
-                position=row_pos(kind, slot),
-                unit="B",
-                unit_scale=True,
-                unit_divisor=1024,
-                leave=True,
-                bar_format=BAR_FMT_UNKNOWN if total_val is None else BAR_FMT_KNOWN,
-                mininterval=0.05,
-                dynamic_ncols=True,
-            )
+    # initialize layout now
+    _calc_layout(last_cols)
 
-    def fmt_dur(sec):
-        if not sec or sec <= 0:
-            return "--"
-        s = int(sec)
-        if s < 60:
-            return f"{s}s"
-        m, s2 = divmod(s, 60)
-        if m < 60:
-            return f"{m}:{s2:02d}"
-        h, m2 = divmod(m, 60)
-        return f"{h}:{m2:02d}"
-
-    # rolling timing stats per stage
-    stage_stats = {
-        "download": {"count": 0, "total_time": 0.0},
-        "extract":  {"count": 0, "total_time": 0.0},
-        "move":     {"count": 0, "total_time": 0.0},
-    }
-
-    # --- STATIC LINES: title + dividers + status line ---
-    title = tqdm(total=1, position=POS_TITLE, leave=True, bar_format="\033[95;1m{desc}\033[0m", mininterval=0)
-    title.desc = "★ ROBINS FILE DOWNLOADER ★"
-    title.n = 1
-    title.refresh()
-
-    def make_divider(position, text):
-        line = tqdm(total=1, position=position, leave=True, bar_format="\033[90m{desc}\033[0m", mininterval=0)
-        if text:
-            line.desc = "─" * 8 + f" {text} " + "─" * 32
-        else:
-            line.desc = "─" * 48
-        line.n = 1
-        line.refresh()
-        return line
-
-    # NEW: divider under header before downloads
     div0 = make_divider(POS_DIV0, "DOWNLOADS")
-    # Existing section dividers
     div1 = make_divider(POS_DIV1, "EXTRACT")
     div2 = make_divider(POS_DIV2, "MOVE")
-    # NEW: divider above overall progress
     div3 = make_divider(POS_DIV3, "OVERALL")
 
-    status = tqdm(total=1, position=POS_STATUS, leave=True, bar_format="\033[90m{desc}\033[0m", mininterval=0)
+    status = tqdm(total=1, position=POS_STATUS, leave=True, bar_format="\u001b[90m{desc}\u001b[0m", mininterval=0, dynamic_ncols=True)
     status.desc = ""
     status.n = 1
     status.refresh()
@@ -527,41 +622,57 @@ def progress_manager():
             status.desc = "Ctrl-C received — stopping new downloads, letting active tasks finish…"
             status.refresh()
 
+    # compact overall info: instantaneous rates + cumulative counts + ETA inside INFO_W
     def update_overall_postfix():
         obar = bars.get(("overall", 0))
         if obar is None:
             return
 
-        dl_a, ex_a, mv_a = active["download"], active["extract"], active["move"]
+        # instantaneous summed rates (MB/s) per stage
+        rates = {"download": 0.0, "extract": 0.0, "move": 0.0}
+        for (k, slot), st in list(state.items()):
+            if k in ("download", "extract", "move"):
+                rates[k] += float(st.get("rate", 0.0))
 
-        dl_avg = (stage_stats["download"]["total_time"] / stage_stats["download"]["count"]) if stage_stats["download"]["count"] else None
-        ex_avg = (stage_stats["extract"]["total_time"]  / stage_stats["extract"]["count"])  if stage_stats["extract"]["count"]  else None
-        mv_avg = (stage_stats["move"]["total_time"]     / stage_stats["move"]["count"])     if stage_stats["move"]["count"]     else None
+        # cumulative completed counts per stage
+        d_done = stage_stats["download"]["count"]
+        e_done = stage_stats["extract"]["count"]
+        m_done = stage_stats["move"]["count"]
 
-        total_avg = None
+        # ETA approximation from avg stage durations
+        dl_avg = (stage_stats["download"]["total_time"] / d_done) if d_done else None
+        ex_avg = (stage_stats["extract"]["total_time"]  / e_done) if e_done else None
+        mv_avg = (stage_stats["move"]["total_time"]     / m_done) if m_done else None
         parts = [t for t in (dl_avg, ex_avg, mv_avg) if t is not None]
-        if parts:
-            total_avg = sum(parts)
+        total_avg = sum(parts) if parts else None
 
         completed = state.get(("overall", 0), {}).get("count", 0)
         remaining = max(0, TOTAL_JOBS - completed)
         eta = (remaining * total_avg) if (total_avg and remaining) else None
 
-        try:
-            canc = cancelled_downloads
-            canc_str = f" | cancelled:{canc}" if canc else ""
-        except NameError:
-            canc_str = ""
+        def fmt_eta(sec):
+            if not sec or sec <= 0:
+                return "--"
+            s = int(sec)
+            m, s = divmod(s, 60)
+            h, m = divmod(m, 60)
+            return f"{h}:{m:02d}" if h else f"{m}:{s:02d}"
 
-        extra = " | STOPPING…" if shutdown_event.is_set() else ""
-        obar.set_postfix_str(
-            "DL:{dl} EX:{ex} MV:{mv} | d:{d} e:{e} m:{m} | item≈{item} ETA≈{eta}{c}{x}".format(
-                dl=dl_a, ex=ex_a, mv=mv_a,
-                d=fmt_dur(dl_avg), e=fmt_dur(ex_avg), m=fmt_dur(mv_avg),
-                item=fmt_dur(total_avg), eta=fmt_dur(eta),
-                c=canc_str, x=extra,
-            )
+        info = (
+            f"D{d_done}@{int(round(rates['download']))}MB/s "
+            f"E{e_done}@{int(round(rates['extract']))}MB/s "
+            f"M{m_done}@{int(round(rates['move']))}MB/s | "
+            f"ETA {fmt_eta(eta)}"
         )
+        if 'cancelled_downloads' in globals() and cancelled_downloads:
+            info += f" | C{cancelled_downloads}"
+        if shutdown_event.is_set():
+            info += " | STOPPING"
+
+        obar.desc = f"Overall"
+        obar.n = completed
+        obar.total = TOTAL_JOBS
+        obar.set_postfix_str(info)
         obar.refresh()
 
     def is_in_progress(done, total, desc):
@@ -574,8 +685,10 @@ def progress_manager():
             return False
         return True
 
-    # --------- MAIN LOOP: drain & coalesce updates each tick ----------
+    # --------- MAIN LOOP ----------
     while True:
+        _maybe_relayout()
+
         try:
             first = progress_queue.get(timeout=0.1)
         except queue.Empty:
@@ -584,7 +697,7 @@ def progress_manager():
                 move_queue.unfinished_tasks == 0):
                 break
             update_status_line()
-            update_overall_postfix()  # keep bottom line fresh
+            update_overall_postfix()
             continue
 
         update_status_line()
@@ -626,9 +739,6 @@ def progress_manager():
                 ost = state[key] = {"count": 0}
                 obar.desc = "Overall"
             ost["count"] = min(TOTAL_JOBS, ost["count"] + overall_incr)
-            obar.n = ost["count"]
-            obar.total = TOTAL_JOBS
-            update_overall_postfix()
 
         now = time.monotonic()
         for (kind, slot), (kind, slot, done, total, desc, job) in latest.items():
@@ -644,12 +754,13 @@ def progress_manager():
                     "last_done": 0,
                     "spd_time": now,
                     "spd_bytes": 0,
-                    "rate": 0.0,
-                    "color": color,
+                    "rate": 0.0,            # MB/s instantaneous, rolling
                     "job": job,
                     "active": False,
                     "job_start_time": now,
                 }
+                # set initial desc
+                bar.desc = fit(f'{color}{kind.capitalize()} {slot+1}{RESET}: {desc}', DESC_W)
                 if is_in_progress(done, total, desc):
                     st["active"] = True
                     st["job_start_time"] = now
@@ -669,12 +780,13 @@ def progress_manager():
 
                 bar.n = 0
                 bar.last_print_n = 0
+                # Re-apply format depending on known/unknown size
                 if total > 0:
                     bar.total = total
-                    bar.bar_format = "{desc}: {percentage:3.0f}%|" + color + "{bar}" + RESET + "| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}"
+                    _apply_layout_to_bar(bar, kind, total_known=True)
                 else:
                     bar.total = None
-                    bar.bar_format = "{desc}: " + color + "{n_fmt}" + RESET + " [{elapsed}] {postfix}"
+                    _apply_layout_to_bar(bar, kind, total_known=False)
                 bar.refresh()
 
                 if is_in_progress(done, total, desc):
@@ -685,21 +797,19 @@ def progress_manager():
 
             if bar.total is None and total > 0:
                 bar.total = total
-                bar.bar_format = "{desc}: {percentage:3.0f}%|" + color + "{bar}" + RESET + "| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}"
+                _apply_layout_to_bar(bar, kind, total_known=True)
 
+            # update counts
             delta = max(0, done - bar.n)
             if delta:
                 bar.update(delta)
             else:
                 bar.n = done
-            bar.desc = f"{color}{kind.capitalize()} {slot+1}{RESET}: {desc}"
 
-            if not st["active"] and is_in_progress(done, total, desc):
-                st["active"] = True
-                st["job_start_time"] = now
-                active[kind] += 1
-                update_overall_postfix()
+            # fixed-width desc & postfix
+            bar.desc = fit(f'{color}{kind.capitalize()} {slot+1}{RESET}: {desc}', DESC_W)
 
+            # rate smoothing (MB/s)
             advance = max(0, done - st["last_done"])
             st["spd_bytes"] += advance
             st["last_done"] = done
@@ -733,6 +843,7 @@ def progress_manager():
 
     for bar in bars.values():
         bar.close()
+
 
 # ---------------- Run ----------------
 with open(url_file) as f:
