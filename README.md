@@ -1,4 +1,4 @@
-# Robin’s File Downloader
+# Multi-threaded batch downloader
 
 Multi-threaded downloader with resume, ZIP extraction, pretty progress bars, and a simple Flask web UI.
 Works great for bulk file grabs or any large URL list.
