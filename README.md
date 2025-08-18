@@ -106,10 +106,10 @@ python main.py --urls <FILE> --dest <FOLDER> [--concurrency N] [--no-extract] [-
   Don’t extract ZIPs; just download/move them.
 
 * `-r, --referrer`
-  Some sites don't allow download with incorrect referrer or slow download speeds, you can set this optionally
+  Some sites don't allow download with an incorrect referrer header or slow download speeds, you can set this optionally
 
 * `--into-subfolder`
-  Extracts each file into a subfolder of destination
+  Extracts/Moves every download into a subfolder in destination folder
 
 ### Examples
 
